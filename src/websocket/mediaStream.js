@@ -1,12 +1,12 @@
 // src/websocket/mediaStream.js
 'use strict';
 
-const { workerPool }                          = require('../pool/workerPool');
-const { clearTwilioAudio }                    = require('../utils/audioSender');
-const { AzureTTSService }                     = require('../services/azureTts');
-const { ChunkStream }                         = require('../utils/chunkStream');
+const { workerPool }        = require('../pool/workerPool');
+const { clearTwilioAudio }  = require('../utils/audioSender');
+const { AzureTTSService }   = require('../services/azureTts');
+const { ChunkStream }       = require('../utils/chunkStream');
+const { FramePacer }        = require('../utils/framePacer');
 
-// Random messages cycled every 10 seconds
 const RANDOM_MESSAGES = [
   'Hello! This is a test message from the server.',
   'Did you know that Node.js uses an event loop?',
@@ -18,8 +18,7 @@ const RANDOM_MESSAGES = [
   'The quick brown fox jumps over the lazy dog.',
 ];
 
-const TTS_INTERVAL_MS = 10_000;  // speak a new message every 10 seconds
-const FRAME_BYTES     = 160;     // 8kHz * 8bit * 20ms = 160 bytes per frame
+const TTS_INTERVAL_MS = 10_000;
 
 async function mediaStreamRoute(fastify) {
   const tts = new AzureTTSService({
@@ -49,6 +48,9 @@ async function mediaStreamRoute(fastify) {
     let ttsCount   = 0;
     let lastMsgAt  = Date.now();
     let msgIndex   = 0;
+
+    // Active pacer — only one TTS utterance plays at a time
+    let activePacer = null;
 
     const INACTIVITY_MS    = 2_000;
     const MARK_INTERVAL_MS = 15_000;
@@ -88,50 +90,49 @@ async function mediaStreamRoute(fastify) {
       if (markTimer) { clearInterval(markTimer); markTimer = null; }
     };
 
-    // ── Azure TTS → 160-byte frames → Twilio ─────────────────────────────────
+    // ── Azure TTS → ChunkStream → FramePacer → Twilio ────────────────────────
     //
-    // Pipeline:
-    //   Azure HTTP stream (raw mulaw, arbitrary chunk sizes)
-    //        ↓
-    //   ChunkStream (slices into exact 160-byte / 20ms frames)
-    //        ↓
-    //   base64 encode each frame
-    //        ↓
-    //   safeSend({ event:'media', streamSid, media:{ payload } })
-    //        ↓
-    //   Twilio plays audio to caller
+    // 1. Azure HTTP stream  →  arbitrary sized mulaw chunks
+    // 2. ChunkStream        →  slices into exact 160-byte frames
+    // 3. FramePacer         →  queues frames, fires one every 20ms via setInterval
+    // 4. safeSend           →  serialized WS write to Twilio
     //
     const speakText = async (text) => {
       if (!streamSid || socket.readyState !== 1) return;
 
+      // Stop any currently playing audio before starting new one
+      if (activePacer) {
+        activePacer.stop();
+        activePacer = null;
+      }
+
       try {
-        fastify.log.info(`[TTS] Speaking: "${text}"`);
+        fastify.log.info(`[TTS] Speaking (${text.length} chars): "${text.substring(0, 60)}"`);
 
         const azureStream = await tts.getStream(text, { emotion: 'cheerful' });
-        const chunker     = new ChunkStream(FRAME_BYTES);
+        const chunker     = new ChunkStream(160);
 
-        // Pipe Azure stream through the 160-byte slicer
+        // Create a new pacer for this utterance
+        const pacer = new FramePacer({ streamSid, safeSend, log: fastify.log });
+        activePacer = pacer;
+
+        // Pipe Azure → ChunkStream → FramePacer
         azureStream.pipe(chunker);
 
         await new Promise((resolve, reject) => {
-          chunker.on('data', (frame) => {
-            // frame is exactly 160 bytes (or less for the final remainder)
-            const payload  = frame.toString('base64');
-            const mediaMsg = JSON.stringify({
-              event:     'media',
-              streamSid,
-              media:     { payload }
-            });
-            safeSend(mediaMsg);
+          chunker.on('data',  (frame) => pacer.push(frame));
+          chunker.on('end',   () => {
+            pacer.flush();    // tell pacer to stop timer after draining queue
+            resolve();
           });
-
-          chunker.on('end',   resolve);
           chunker.on('error', reject);
           azureStream.on('error', reject);
         });
 
         ttsCount++;
-        fastify.log.info(`[TTS] Done msg #${ttsCount} streamSid=${streamSid}`);
+        fastify.log.info(
+          `[TTS] Buffered msg #${ttsCount} — frames=${pacer.pending + pacer.sent} streamSid=${streamSid}`
+        );
 
       } catch (err) {
         if (err.name !== 'AbortError') {
@@ -143,7 +144,6 @@ async function mediaStreamRoute(fastify) {
 
     const startTtsInterval = () => {
       stopTtsInterval();
-      // Speak greeting immediately, then every 10s
       speakText('Hello! I will send you a message every ten seconds.');
       ttsTimer = setInterval(async () => {
         const text = RANDOM_MESSAGES[msgIndex % RANDOM_MESSAGES.length];
@@ -153,7 +153,8 @@ async function mediaStreamRoute(fastify) {
     };
 
     const stopTtsInterval = () => {
-      if (ttsTimer) { clearInterval(ttsTimer); ttsTimer = null; }
+      if (ttsTimer)  { clearInterval(ttsTimer); ttsTimer = null; }
+      if (activePacer) { activePacer.stop(); activePacer = null; }
     };
 
     // Message handler
@@ -185,7 +186,6 @@ async function mediaStreamRoute(fastify) {
           case 'media': {
             if (msg.media?.track === 'outbound') break;
             if (!msg.media?.payload) break;
-
             frameCount++;
 
             if (workerPool.queue.length > 100) {
