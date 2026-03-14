@@ -36,14 +36,10 @@ class WorkerPool {
           pending.reject(new Error(msg.err));
         } else {
           this.stats.completed++;
-
-          // Reconstruct Int16Array from the transferred ArrayBuffer
-          // This is zero-copy — the ArrayBuffer was transferred, not cloned
-          const int16  = new Int16Array(msg.pcmArrayBuffer);
-
-          // Also expose as Buffer for any consumers that need Buffer API
-          const pcmBuf = Buffer.from(msg.pcmArrayBuffer);
-
+          // Reconstruct from transferred ArrayBuffer
+          // pcmAB is now owned by main thread (zero-copy)
+          const int16  = new Int16Array(msg.pcmAB);
+          const pcmBuf = Buffer.from(msg.pcmAB);
           pending.resolve({ int16, pcmBuf });
         }
       } else {
@@ -61,7 +57,7 @@ class WorkerPool {
 
     worker.on('exit', (code) => {
       if (code !== 0) {
-        console.warn(`[POOL] Worker ${id} exited (code ${code}), respawning…`);
+        console.warn(`[POOL] Worker ${id} exited (code ${code}), respawning...`);
         const idx = this.workers.indexOf(worker);
         if (idx >= 0) this.workers.splice(idx, 1);
         this._spawnWorker(id);
@@ -79,7 +75,7 @@ class WorkerPool {
       const timer = setTimeout(() => {
         this.pendingTasks.delete(taskId);
         this.stats.errors++;
-        reject(new Error(`Worker timeout – queue depth: ${this.queue.length}`));
+        reject(new Error(`Worker timeout - queue depth: ${this.queue.length}`));
       }, 5_000);
 
       this.pendingTasks.set(taskId, {
