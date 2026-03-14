@@ -1,10 +1,33 @@
 // src/websocket/mediaStream.js
 'use strict';
 
-const { workerPool }                      = require('../pool/workerPool');
+const { workerPool }                          = require('../pool/workerPool');
 const { sendAudioToTwilio, clearTwilioAudio } = require('../utils/audioSender');
+const { AzureTTSService }                     = require('../services/azureTts');
+
+// Random messages sent to caller every 10 seconds
+const RANDOM_MESSAGES = [
+  'Hello! This is a test message from the server.',
+  'Did you know that Node.js uses an event loop?',
+  'Azure Text to Speech sounds pretty natural, right?',
+  'This message was synthesized in real time.',
+  'Twilio media streams make bidirectional audio easy.',
+  'Your call is being processed by a Fastify server.',
+  'Another random message coming your way!',
+  'The quick brown fox jumps over the lazy dog.',
+];
+
+const TTS_INTERVAL_MS = 10_000;  // send a TTS message every 10 seconds
 
 async function mediaStreamRoute(fastify) {
+  // Build Azure TTS service once — shared HTTPS agent across all calls
+  const tts = new AzureTTSService({
+    speechKey:    process.env.AZURE_SPEECH_KEY,
+    speechRegion: process.env.AZURE_SPEECH_REGION,
+    voiceName:    process.env.AZURE_VOICE_NAME || 'en-US-JennyNeural',
+    log:          fastify.log
+  });
+
   fastify.get('/media-stream', { websocket: true }, (connection, request) => {
     const socket            = connection.socket;
     const clientInfo        = `${request.socket.remoteAddress}:${request.socket.remotePort}`;
@@ -23,15 +46,17 @@ async function mediaStreamRoute(fastify) {
     let streamSid  = null;
     let callSid    = null;
     let frameCount = 0;
-    let echoCount  = 0;
+    let ttsCount   = 0;
     let lastMsgAt  = Date.now();
+    let msgIndex   = 0;   // cycles through RANDOM_MESSAGES in order
 
     const INACTIVITY_MS    = 2_000;
     const MARK_INTERVAL_MS = 15_000;
     let inactivityTimer    = null;
     let markTimer          = null;
+    let ttsTimer           = null;
 
-    // Serialized socket writes
+    // Serialized socket writes — no concurrent write race
     let writeQueue = Promise.resolve();
     const safeSend = (data) => {
       writeQueue = writeQueue
@@ -65,6 +90,62 @@ async function mediaStreamRoute(fastify) {
       if (markTimer) { clearInterval(markTimer); markTimer = null; }
     };
 
+    // ── Azure TTS → Twilio pipeline ──────────────────────────────────────────
+    // Reads the raw mulaw stream from Azure and sends each chunk directly
+    // to Twilio via safeSend. No re-encoding needed — Azure outputs
+    // raw-8khz-8bit-mono-mulaw which is exactly Twilio's expected format.
+    const speakText = async (text) => {
+      if (!streamSid || socket.readyState !== 1) return;
+
+      try {
+        fastify.log.info(`[TTS] Speaking: "${text}"`);
+
+        const stream = await tts.getStream(text, { emotion: 'cheerful' });
+
+        await new Promise((resolve, reject) => {
+          stream.on('data', (chunk) => {
+            // chunk is already raw mulaw bytes from Azure — base64 encode and send
+            const payload  = chunk.toString('base64');
+            const mediaMsg = JSON.stringify({
+              event:     'media',
+              streamSid,
+              media:     { payload }
+            });
+            safeSend(mediaMsg);
+          });
+
+          stream.on('end',   resolve);
+          stream.on('error', reject);
+        });
+
+        ttsCount++;
+        fastify.log.info(`[TTS] Done speaking msg #${ttsCount}`);
+
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          fastify.log.error(`[TTS] Error: ${err.message}`);
+        }
+      }
+    };
+
+    // Start sending TTS messages every 10 seconds once stream begins
+    const startTtsInterval = () => {
+      stopTtsInterval();
+      ttsTimer = setInterval(async () => {
+        const text = RANDOM_MESSAGES[msgIndex % RANDOM_MESSAGES.length];
+        msgIndex++;
+        await speakText(text);
+      }, TTS_INTERVAL_MS);
+
+      // Speak first message immediately on stream start
+      speakText('Hello! I will send you a message every ten seconds.');
+    };
+
+    const stopTtsInterval = () => {
+      if (ttsTimer) { clearInterval(ttsTimer); ttsTimer = null; }
+    };
+    // ─────────────────────────────────────────────────────────────────────────
+
     // Message handler
     socket.on('message', async (raw) => {
       try {
@@ -88,10 +169,11 @@ async function mediaStreamRoute(fastify) {
             lastMsgAt = Date.now();
             resetInactivityTimer();
             startHeartbeat();
+            startTtsInterval();   // ← begin sending TTS every 10s
             break;
 
           case 'media': {
-            // Only process inbound track
+            // Skip outbound frames echoed back by Twilio
             if (msg.media?.track === 'outbound') break;
             if (!msg.media?.payload) break;
 
@@ -103,35 +185,21 @@ async function mediaStreamRoute(fastify) {
             }
 
             try {
-              // Decode µ-law → PCM in worker thread
-              // Result: { pcm: Buffer, int16: Int16Array }
-              const { pcm: pcmBuf, int16 } = await workerPool.execute({
+              // Decode inbound mulaw (used for future STT / VAD)
+              await workerPool.execute({
                 payloadBase64: msg.media.payload,
                 streamSid,
                 timestamp:     msg.media.timestamp
-            });
-
-              // Echo audio back to caller
-              // int16 (Int16Array) is passed directly — no conversion needed
-              sendAudioToTwilio({
-                socket,
-                streamSid,
-                int16,     // ← Int16Array, correct type for alawmulaw.mulaw.encode()
-                pcmBuf,    // ← Buffer fallback (not used when int16 is present)
-                safeSend,
-                log: fastify.log
               });
 
-              echoCount++;
               lastMsgAt = Date.now();
               resetInactivityTimer();
 
               if (frameCount % 100 === 0) {
                 fastify.log.debug(
-                  `[WS] frames=${frameCount} echoed=${echoCount} pool=${JSON.stringify(workerPool.getStats())}`
+                  `[WS] frames=${frameCount} tts=${ttsCount} pool=${JSON.stringify(workerPool.getStats())}`
                 );
               }
-
             } catch (err) {
               fastify.log.error(`[WS] decode error streamSid=${streamSid}: ${err.message}`);
             }
@@ -145,7 +213,8 @@ async function mediaStreamRoute(fastify) {
             break;
 
           case 'stop':
-            fastify.log.info(`[WS] stream stopped streamSid=${streamSid} frames=${frameCount} echoed=${echoCount}`);
+            fastify.log.info(`[WS] stream stopped streamSid=${streamSid} frames=${frameCount} tts=${ttsCount}`);
+            stopTtsInterval();
             clearTwilioAudio({ safeSend, streamSid });
             lastMsgAt = Date.now();
             resetInactivityTimer();
@@ -171,15 +240,16 @@ async function mediaStreamRoute(fastify) {
         event: 'ws_closed', code,
         reason: reason.toString() || 'N/A',
         duration_ms: duration,
-        duration_s: (duration / 1000).toFixed(2),
-        streamSid, callSid, frameCount, echoCount,
-        pool: workerPool.getStats(),
+        duration_s:  (duration / 1000).toFixed(2),
+        streamSid, callSid, frameCount, ttsCount,
+        pool:  workerPool.getStats(),
         memMB: (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2),
         clientInfo
       });
       clearTimeout(inactivityTimer);
       stopHeartbeat();
-      streamSid = null; callSid = null; frameCount = 0; echoCount = 0;
+      stopTtsInterval();
+      streamSid = null; callSid = null; frameCount = 0; ttsCount = 0;
     });
 
     socket.on('error', (err) => fastify.log.error(`[WS] socket error [${clientInfo}]: ${err.message}`));

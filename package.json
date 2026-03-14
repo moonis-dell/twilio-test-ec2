@@ -7,7 +7,7 @@
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
-  "keywords": ["twilio", "media-stream", "fastify", "websocket", "mulaw", "worker-threads"],
+  "keywords": ["twilio", "media-stream", "fastify", "websocket", "mulaw", "worker-threads", "azure-tts"],
   "author": "",
   "license": "MIT",
   "dependencies": {
