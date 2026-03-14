@@ -1,20 +1,18 @@
 // src/routes/twilio.js
-// Handles the POST /call endpoint that Twilio hits to get the TwiML
-// with the WebSocket stream URL.
 'use strict';
 
 async function twilioRoutes(fastify) {
   /**
    * POST /call
    *
-   * Twilio calls this endpoint when a call comes in (set as your
-   * Twilio phone number's Voice Webhook URL).
+   * Twilio Voice Webhook. Returns TwiML to start a BIDIRECTIONAL media stream.
    *
-   * Twilio sends x-www-form-urlencoded body with fields like:
-   *   CallSid, From, To, CallStatus, Direction, etc.
+   * KEY: <Connect><Stream> = bidirectional (send + receive audio)
+   *      <Start><Stream>   = unidirectional (receive only, outbound media ignored)
    *
-   * We respond with TwiML that starts a Media Stream and keeps
-   * the call alive with a long <Pause>.
+   * NOTE: With <Connect><Stream>, Twilio blocks on this verb and does NOT
+   * execute any subsequent TwiML until the WebSocket is closed by your server.
+   * No <Pause> needed — the call stays alive as long as the WS is open.
    */
   fastify.post('/call', async (request, reply) => {
     const { CallSid, From, To, CallStatus } = request.body || {};
@@ -27,29 +25,27 @@ async function twilioRoutes(fastify) {
       status: CallStatus
     });
 
-    // Build the WebSocket URL dynamically from the incoming request host
-    // so this works in any environment (dev, staging, prod) without
-    // hardcoding the domain.
+    // Build WebSocket URL dynamically — works in any environment
     const host = process.env.SERVER_HOST ||
                  request.headers['x-forwarded-host'] ||
                  request.hostname;
 
     const wsUrl = `wss://${host}/media-stream`;
 
-    fastify.log.info(`[TWILIO] Returning WS URL: ${wsUrl}`);
+    fastify.log.info(`[TWILIO] Bidirectional stream URL: ${wsUrl}`);
 
+    // <Connect><Stream> = BIDIRECTIONAL
+    // Twilio will send inbound audio AND accept outbound audio from your server.
+    // The call stays alive until your server closes the WebSocket connection.
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Start>
+  <Connect>
     <Stream url="${wsUrl}">
       <Parameter name="callSid" value="${CallSid || ''}"/>
       <Parameter name="from"    value="${From    || ''}"/>
       <Parameter name="to"      value="${To      || ''}"/>
     </Stream>
-  </Start>
-  <!-- Keep the call alive while the WebSocket stream is active.
-       Increase this value for longer expected call durations. -->
-  <Pause length="120"/>
+  </Connect>
 </Response>`;
 
     reply
@@ -60,11 +56,7 @@ async function twilioRoutes(fastify) {
 
   /**
    * POST /call/status
-   *
-   * Optional: Twilio status-callback endpoint.
-   * Configure this as the StatusCallback URL in your Twilio number settings
-   * to receive real-time call status updates (initiated, ringing, answered,
-   * completed, busy, no-answer, failed, canceled).
+   * Twilio StatusCallback — logs call lifecycle events.
    */
   fastify.post('/call/status', async (request, reply) => {
     const { CallSid, CallStatus, CallDuration, From, To } = request.body || {};
@@ -78,7 +70,6 @@ async function twilioRoutes(fastify) {
       to: To
     });
 
-    // Twilio expects a 204 No Content or 200 OK for status callbacks
     reply.code(204).send();
   });
 }
