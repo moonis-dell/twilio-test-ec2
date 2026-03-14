@@ -1,12 +1,5 @@
 // src/utils/framePacer.js
 // Queues 160-byte mulaw frames and releases one every 20ms via setInterval.
-// Prevents flooding Twilio with bursted frames from Azure TTS.
-//
-// Usage:
-//   const pacer = new FramePacer({ streamSid, safeSend, log });
-//   pacer.push(frame);   // called for each 160-byte chunk
-//   pacer.flush();       // call after stream ends (drains remainder + stops timer)
-//   pacer.stop();        // call on hangup / interrupt (discards queue)
 'use strict';
 
 const FRAME_MS    = 20;   // one frame every 20ms
@@ -14,46 +7,43 @@ const FRAME_BYTES = 160;  // 8kHz * 8bit * 20ms
 
 class FramePacer {
   /**
-   * @param {object}   opts
-   * @param {string}   opts.streamSid  - Twilio stream SID
-   * @param {Function} opts.safeSend   - serialized WS send fn
-   * @param {object}   opts.log        - fastify logger
+   * @param {object}    opts
+   * @param {string}    opts.streamSid
+   * @param {Function}  opts.safeSend
+   * @param {object}    opts.log
+   * @param {WebSocket} opts.socket     - checked each tick to auto-stop on close
    */
-  constructor({ streamSid, safeSend, log }) {
+  constructor({ streamSid, safeSend, log, socket }) {
     this.streamSid = streamSid;
     this.safeSend  = safeSend;
     this.log       = log;
-
-    this._queue    = [];      // Buffer[] of 160-byte frames waiting to be sent
+    this.socket    = socket;
+    this._queue    = [];
     this._timer    = null;
     this._flushing = false;
+    this._stopped  = false;
     this._sent     = 0;
   }
 
-  // Called for each 160-byte chunk produced by ChunkStream
   push(frame) {
+    if (this._stopped) return;
     this._queue.push(frame);
     if (!this._timer) this._start();
   }
 
-  // Called when Azure stream ends — drains remaining queue then auto-stops
   flush() {
+    if (this._stopped) return;
     this._flushing = true;
-    // If queue is already empty when flush() called, stop immediately
     if (this._queue.length === 0) this._stop();
   }
 
-  // Discard everything — call on hangup or barge-in
   stop() {
+    this._stopped = true;
     this._stop();
     this._queue = [];
-    this._flushing = false;
   }
 
-  // Total frames sent so far
-  get sent() { return this._sent; }
-
-  // Frames still waiting in queue
+  get sent()    { return this._sent; }
   get pending() { return this._queue.length; }
 
   _start() {
@@ -62,39 +52,33 @@ class FramePacer {
   }
 
   _stop() {
-    if (this._timer) {
-      clearInterval(this._timer);
-      this._timer = null;
-    }
+    if (this._timer) { clearInterval(this._timer); this._timer = null; }
   }
 
   _tick() {
+    // Auto-stop if socket closed mid-drain (e.g. SIGTERM, hangup)
+    if (this.socket.readyState !== 1 /* WS.OPEN */) {
+      this.log.debug(`[PACER] Socket not open, stopping pacer streamSid=${this.streamSid}`);
+      this.stop();
+      return;
+    }
+
     if (this._queue.length === 0) {
-      // Queue drained
       if (this._flushing) {
-        this.log.debug(
-          `[PACER] Done — sent=${this._sent} streamSid=${this.streamSid}`
-        );
+        this.log.debug(`[PACER] Queue drained — sent=${this._sent} streamSid=${this.streamSid}`);
         this._stop();
       }
       return;
     }
 
-    const frame   = this._queue.shift();
-    const payload = frame.toString('base64');
-
+    const payload = this._queue.shift().toString('base64');
     this.safeSend(JSON.stringify({
-      event:     'media',
-      streamSid: this.streamSid,
-      media:     { payload }
+      event: 'media', streamSid: this.streamSid, media: { payload }
     }));
-
     this._sent++;
 
     if (this._sent % 50 === 0) {
-      this.log.debug(
-        `[PACER] sent=${this._sent} pending=${this._queue.length} streamSid=${this.streamSid}`
-      );
+      this.log.debug(`[PACER] sent=${this._sent} pending=${this._queue.length} streamSid=${this.streamSid}`);
     }
   }
 }
