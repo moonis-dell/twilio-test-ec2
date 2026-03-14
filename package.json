@@ -1,27 +1,19 @@
 {
-  "name": "twilio-media-stream-fastify",
-  "version": "1.0.0",
-  "description": "Production-ready Fastify WebSocket server for Twilio Media Streams with worker-thread pool for non-blocking audio processing",
+  "name": "twilio-test-ec2",
+  "version": "2.0.0",
+  "description": "Production-ready Fastify WebSocket server for Twilio Media Streams with worker-thread pool",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
-  "keywords": [
-    "twilio",
-    "media-stream",
-    "fastify",
-    "websocket",
-    "mulaw",
-    "worker-threads",
-    "real-time-audio",
-    "voice-ai"
-  ],
+  "keywords": ["twilio", "media-stream", "fastify", "websocket", "mulaw", "worker-threads"],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "fastify": "^5.0.0",
     "@fastify/websocket": "^7.0.0",
+    "@fastify/formbody": "^7.0.0",
     "alawmulaw": "^1.0.2"
   },
   "devDependencies": {
