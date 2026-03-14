@@ -3,16 +3,20 @@
 'use strict';
 
 const { parentPort } = require('worker_threads');
-const { decode }     = require('alawmulaw');
+const alawmulaw     = require('alawmulaw');
 
 /**
- * Incoming message shape:
+ * alawmulaw API:
+ *   alawmulaw.mulaw.decode(Uint8Array)  → Int16Array  (mulaw → PCM)
+ *   alawmulaw.mulaw.encode(Int16Array)  → Uint8Array  (PCM → mulaw)
+ *
+ * Incoming message:
  *   { payloadBase64, streamSid, timestamp, taskId }
  *
- * Reply shape (success):
- *   { streamSid, pcm: Buffer, timestamp, taskId, ok: true }
+ * Reply (success):
+ *   { streamSid, pcm: Buffer, int16: Int16Array, timestamp, taskId, ok: true }
  *
- * Reply shape (error):
+ * Reply (error):
  *   { streamSid, timestamp, taskId, err: string }
  */
 parentPort.on('message', (msg) => {
@@ -21,24 +25,36 @@ parentPort.on('message', (msg) => {
   try {
     if (!payloadBase64) throw new Error('Missing payloadBase64');
 
-    // Validate base64 characters
+    // Validate base64
     if (!/^[A-Za-z0-9+/=]+$/.test(payloadBase64)) {
       throw new Error('Invalid base64 payload');
     }
 
-    // Step 1: base64 → raw µ-law Buffer
-    const mulawBuf = Buffer.from(payloadBase64, 'base64');
+    // Step 1: base64 → raw µ-law bytes as Uint8Array
+    // IMPORTANT: alawmulaw.mulaw.decode() requires Uint8Array, not Buffer
+    const mulawBytes = new Uint8Array(Buffer.from(payloadBase64, 'base64'));
 
-    // Step 2: Sanity-check size
-    // Twilio 8 kHz µ-law: 160 bytes per 20 ms frame (range 80–320 bytes)
-    if (mulawBuf.length < 80 || mulawBuf.length > 320) {
-      throw new Error(`Unexpected µ-law size: ${mulawBuf.length} bytes`);
+    // Validate size: Twilio 8kHz µ-law = 160 bytes per 20ms frame
+    if (mulawBytes.length < 80 || mulawBytes.length > 320) {
+      throw new Error(`Unexpected µ-law size: ${mulawBytes.length} bytes`);
     }
 
-    // Step 3: µ-law → 16-bit signed linear PCM (CPU-bound, safe in worker)
-    const pcmBuf = decode(mulawBuf);
+    // Step 2: µ-law (Uint8Array) → PCM (Int16Array)
+    // decode() returns Int16Array — keep it as Int16Array for re-encoding
+    const pcmInt16 = alawmulaw.mulaw.decode(mulawBytes);
 
-    parentPort.postMessage({ streamSid, pcm: pcmBuf, timestamp, taskId, ok: true });
+    // Step 3: Also expose as Buffer for consumers that need Buffer API
+    const pcmBuf = Buffer.from(pcmInt16.buffer);
+
+    parentPort.postMessage({
+      streamSid,
+      pcm:    pcmBuf,     // Buffer  ← for WAV writers, file I/O, etc.
+      int16:  pcmInt16,   // Int16Array ← for re-encoding back to µ-law
+      timestamp,
+      taskId,
+      ok: true
+    });
+
   } catch (err) {
     parentPort.postMessage({ streamSid, timestamp, taskId, err: err.message });
   }

@@ -1,41 +1,38 @@
 // src/utils/audioSender.js
-// Encodes PCM audio back to µ-law and sends it to Twilio as a media message.
+// Encodes PCM audio back to µ-law and sends it to Twilio as an outbound media message.
 //
-// Twilio outbound media message format (from official docs):
+// Twilio outbound media message (from official docs):
 // {
-//   event:    'media',
+//   event:     'media',
 //   streamSid: '<SID>',
 //   media: {
-//     payload: '<base64-encoded mulaw/8000>'   // ← NO track field
+//     payload: '<base64 mulaw/8000>'   ← raw bytes, NO file headers
 //   }
 // }
 //
-// IMPORTANT:
-//  - Only works with <Connect><Stream> TwiML (bidirectional)
-//  - <Start><Stream> is unidirectional — outbound messages are silently ignored
-//  - payload must be raw mulaw/8000 base64 — NO audio file headers (no WAV, no MP3)
+// REQUIREMENTS:
+//  - <Connect><Stream> TwiML (bidirectional) — NOT <Start><Stream>
+//  - encode() input MUST be Int16Array — NOT a Buffer
+//  - Output must be raw mulaw bytes — no WAV/MP3 headers
 'use strict';
 
-const { encode } = require('alawmulaw');
+const alawmulaw = require('alawmulaw');
 
 /**
- * Encode a PCM Buffer to µ-law and send it to Twilio as outbound audio.
+ * Send PCM audio back to Twilio as outbound µ-law audio.
  *
- * @param {import('ws').WebSocket} socket    - live WS connection
- * @param {string}                 streamSid - Twilio stream SID
- * @param {Buffer}                 pcmBuf    - 16-bit signed linear PCM at 8kHz
- * @param {Function}               safeSend  - serialized send function
- * @param {object}                 log       - fastify logger
+ * @param {object}   opts
+ * @param {WebSocket} opts.socket     - live WS connection
+ * @param {string}    opts.streamSid  - Twilio stream SID
+ * @param {Int16Array} opts.int16     - decoded PCM as Int16Array (preferred)
+ * @param {Buffer}    [opts.pcmBuf]   - fallback: raw PCM Buffer (converted internally)
+ * @param {Function}  opts.safeSend   - serialized send fn
+ * @param {object}    opts.log        - fastify logger
  */
-function sendAudioToTwilio({ socket, streamSid, pcmBuf, safeSend, log }) {
+function sendAudioToTwilio({ socket, streamSid, int16, pcmBuf, safeSend, log }) {
   try {
     if (!streamSid) {
       log.warn('[AUDIO] Cannot send — streamSid not set yet');
-      return;
-    }
-
-    if (!pcmBuf || pcmBuf.length === 0) {
-      log.warn('[AUDIO] Empty PCM buffer, skipping');
       return;
     }
 
@@ -44,24 +41,44 @@ function sendAudioToTwilio({ socket, streamSid, pcmBuf, safeSend, log }) {
       return;
     }
 
-    // Step 1: PCM (16-bit signed linear, 8kHz) → µ-law
-    const mulawBuf = encode(pcmBuf);
+    // Resolve input: prefer Int16Array, fall back to converting Buffer
+    // CRITICAL: alawmulaw.mulaw.encode() requires Int16Array NOT Buffer
+    let samples;
+    if (int16 instanceof Int16Array) {
+      samples = int16;
+    } else if (Buffer.isBuffer(pcmBuf) && pcmBuf.length > 0) {
+      // Convert raw PCM Buffer → Int16Array
+      // Each PCM sample is 2 bytes (16-bit), little-endian
+      samples = new Int16Array(
+        pcmBuf.buffer,
+        pcmBuf.byteOffset,
+        pcmBuf.byteLength / 2
+      );
+    } else {
+      log.warn('[AUDIO] No valid audio data (need Int16Array or PCM Buffer)');
+      return;
+    }
 
-    // Step 2: µ-law Buffer → base64
-    // NOTE: mulawBuf is raw audio bytes — no file headers, exactly what Twilio expects
-    const payload = mulawBuf.toString('base64');
+    if (samples.length === 0) {
+      log.warn('[AUDIO] Empty samples, skipping');
+      return;
+    }
 
-    // Step 3: Build outbound media message
-    // Per Twilio docs: only event, streamSid, media.payload — NO track field
+    // Step 1: PCM Int16Array → µ-law Uint8Array
+    // encode() returns Uint8Array — raw mulaw bytes, no headers
+    const mulawBytes = alawmulaw.mulaw.encode(samples);
+
+    // Step 2: Uint8Array → base64 string
+    const payload = Buffer.from(mulawBytes).toString('base64');
+
+    // Step 3: Twilio outbound media message (exact format from docs)
     const mediaMsg = JSON.stringify({
       event:     'media',
       streamSid,
-      media: {
-        payload   // raw mulaw/8000 base64 — no track, no chunk, no timestamp
-      }
+      media: { payload }   // NO track, NO chunk, NO timestamp — just payload
     });
 
-    // Step 4: Send through serialized write queue
+    // Step 4: Enqueue via serialized write queue
     safeSend(mediaMsg);
 
   } catch (err) {
@@ -70,17 +87,11 @@ function sendAudioToTwilio({ socket, streamSid, pcmBuf, safeSend, log }) {
 }
 
 /**
- * Send a 'clear' event to Twilio to flush buffered outbound audio.
- * Use this to interrupt currently playing audio (e.g., barge-in).
- *
- * @param {Function} safeSend
- * @param {string}   streamSid
+ * Send a 'clear' event to flush Twilio's outbound audio buffer.
+ * Use for barge-in / interruption.
  */
 function clearTwilioAudio({ safeSend, streamSid }) {
-  safeSend(JSON.stringify({
-    event:     'clear',
-    streamSid
-  }));
+  safeSend(JSON.stringify({ event: 'clear', streamSid }));
 }
 
 module.exports = { sendAudioToTwilio, clearTwilioAudio };

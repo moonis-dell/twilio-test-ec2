@@ -10,8 +10,8 @@ class WorkerPool {
   constructor(size = os.cpus().length) {
     this.size         = size;
     this.workers      = [];
-    this.queue        = [];           // pending { msg, taskId }
-    this.pendingTasks = new Map();    // taskId → { resolve, reject }
+    this.queue        = [];
+    this.pendingTasks = new Map();
     this.stats        = { queued: 0, completed: 0, errors: 0 };
     this._init();
   }
@@ -32,10 +32,12 @@ class WorkerPool {
       if (pending) {
         this.pendingTasks.delete(msg.taskId);
         msg.err
-          ? (this.stats.errors++,   pending.reject(new Error(msg.err)))
-          : (this.stats.completed++, pending.resolve(msg.pcm));
+          ? (this.stats.errors++,    pending.reject(new Error(msg.err)))
+          : (this.stats.completed++, pending.resolve({
+              pcm:   msg.pcm,    // Buffer
+              int16: msg.int16   // Int16Array ← needed for mulaw re-encode
+            }));
       } else {
-        // Should never happen – log if it does
         console.error(`[POOL] Orphaned response taskId=${msg.taskId}`);
       }
 
@@ -53,24 +55,19 @@ class WorkerPool {
         console.warn(`[POOL] Worker ${id} exited (code ${code}), respawning…`);
         const idx = this.workers.indexOf(worker);
         if (idx >= 0) this.workers.splice(idx, 1);
-        this._spawnWorker(id); // replace with fresh worker
+        this._spawnWorker(id);
       }
     });
 
     this.workers.push(worker);
   }
 
-  /**
-   * Submit a decode task.
-   * Returns a Promise that resolves with the PCM Buffer.
-   */
   execute(msg) {
     this.stats.queued++;
 
     return new Promise((resolve, reject) => {
       const taskId = `${msg.streamSid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-      // Guard against hung workers
       const timer = setTimeout(() => {
         this.pendingTasks.delete(taskId);
         this.stats.errors++;
@@ -87,7 +84,6 @@ class WorkerPool {
     });
   }
 
-  /** Dispatch queued tasks to free workers. */
   _drain() {
     while (this.queue.length > 0) {
       const free = this.workers.find(w => !w.isBusy);
@@ -113,7 +109,5 @@ class WorkerPool {
   }
 }
 
-// Singleton – shared across the entire process
 const workerPool = new WorkerPool();
-
 module.exports = { WorkerPool, workerPool };
