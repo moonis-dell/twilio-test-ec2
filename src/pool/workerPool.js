@@ -1,5 +1,4 @@
 // src/pool/workerPool.js
-// Singleton worker-thread pool for non-blocking µ-law → PCM decoding
 'use strict';
 
 const { Worker } = require('worker_threads');
@@ -31,12 +30,22 @@ class WorkerPool {
       const pending = this.pendingTasks.get(msg.taskId);
       if (pending) {
         this.pendingTasks.delete(msg.taskId);
-        msg.err
-          ? (this.stats.errors++,    pending.reject(new Error(msg.err)))
-          : (this.stats.completed++, pending.resolve({
-              pcm:   msg.pcm,    // Buffer
-              int16: msg.int16   // Int16Array ← needed for mulaw re-encode
-            }));
+
+        if (msg.err) {
+          this.stats.errors++;
+          pending.reject(new Error(msg.err));
+        } else {
+          this.stats.completed++;
+
+          // Reconstruct Int16Array from the transferred ArrayBuffer
+          // This is zero-copy — the ArrayBuffer was transferred, not cloned
+          const int16  = new Int16Array(msg.pcmArrayBuffer);
+
+          // Also expose as Buffer for any consumers that need Buffer API
+          const pcmBuf = Buffer.from(msg.pcmArrayBuffer);
+
+          pending.resolve({ int16, pcmBuf });
+        }
       } else {
         console.error(`[POOL] Orphaned response taskId=${msg.taskId}`);
       }
@@ -64,7 +73,6 @@ class WorkerPool {
 
   execute(msg) {
     this.stats.queued++;
-
     return new Promise((resolve, reject) => {
       const taskId = `${msg.streamSid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
