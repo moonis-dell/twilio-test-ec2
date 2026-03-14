@@ -2,10 +2,11 @@
 'use strict';
 
 const { workerPool }                          = require('../pool/workerPool');
-const { sendAudioToTwilio, clearTwilioAudio } = require('../utils/audioSender');
+const { clearTwilioAudio }                    = require('../utils/audioSender');
 const { AzureTTSService }                     = require('../services/azureTts');
+const { ChunkStream }                         = require('../utils/chunkStream');
 
-// Random messages sent to caller every 10 seconds
+// Random messages cycled every 10 seconds
 const RANDOM_MESSAGES = [
   'Hello! This is a test message from the server.',
   'Did you know that Node.js uses an event loop?',
@@ -17,10 +18,10 @@ const RANDOM_MESSAGES = [
   'The quick brown fox jumps over the lazy dog.',
 ];
 
-const TTS_INTERVAL_MS = 10_000;  // send a TTS message every 10 seconds
+const TTS_INTERVAL_MS = 10_000;  // speak a new message every 10 seconds
+const FRAME_BYTES     = 160;     // 8kHz * 8bit * 20ms = 160 bytes per frame
 
 async function mediaStreamRoute(fastify) {
-  // Build Azure TTS service once — shared HTTPS agent across all calls
   const tts = new AzureTTSService({
     speechKey:    process.env.AZURE_SPEECH_KEY,
     speechRegion: process.env.AZURE_SPEECH_REGION,
@@ -35,7 +36,6 @@ async function mediaStreamRoute(fastify) {
 
     fastify.log.info(`[WS] New connection from ${clientInfo}`);
 
-    // TCP keep-alive
     const tcpSocket = socket._socket;
     if (tcpSocket?.setKeepAlive) {
       tcpSocket.setKeepAlive(true, 30_000);
@@ -48,7 +48,7 @@ async function mediaStreamRoute(fastify) {
     let frameCount = 0;
     let ttsCount   = 0;
     let lastMsgAt  = Date.now();
-    let msgIndex   = 0;   // cycles through RANDOM_MESSAGES in order
+    let msgIndex   = 0;
 
     const INACTIVITY_MS    = 2_000;
     const MARK_INTERVAL_MS = 15_000;
@@ -56,7 +56,7 @@ async function mediaStreamRoute(fastify) {
     let markTimer          = null;
     let ttsTimer           = null;
 
-    // Serialized socket writes — no concurrent write race
+    // Serialized socket writes
     let writeQueue = Promise.resolve();
     const safeSend = (data) => {
       writeQueue = writeQueue
@@ -68,7 +68,6 @@ async function mediaStreamRoute(fastify) {
       return writeQueue;
     };
 
-    // Inactivity monitor
     const resetInactivityTimer = () => {
       clearTimeout(inactivityTimer);
       inactivityTimer = setTimeout(() => {
@@ -76,7 +75,6 @@ async function mediaStreamRoute(fastify) {
       }, INACTIVITY_MS);
     };
 
-    // Mark heartbeat
     const sendMark = (label = `hb-${Date.now()}`) => {
       if (!streamSid) return;
       safeSend(JSON.stringify({ event: 'mark', streamSid, mark: { name: label } }));
@@ -90,22 +88,35 @@ async function mediaStreamRoute(fastify) {
       if (markTimer) { clearInterval(markTimer); markTimer = null; }
     };
 
-    // ── Azure TTS → Twilio pipeline ──────────────────────────────────────────
-    // Reads the raw mulaw stream from Azure and sends each chunk directly
-    // to Twilio via safeSend. No re-encoding needed — Azure outputs
-    // raw-8khz-8bit-mono-mulaw which is exactly Twilio's expected format.
+    // ── Azure TTS → 160-byte frames → Twilio ─────────────────────────────────
+    //
+    // Pipeline:
+    //   Azure HTTP stream (raw mulaw, arbitrary chunk sizes)
+    //        ↓
+    //   ChunkStream (slices into exact 160-byte / 20ms frames)
+    //        ↓
+    //   base64 encode each frame
+    //        ↓
+    //   safeSend({ event:'media', streamSid, media:{ payload } })
+    //        ↓
+    //   Twilio plays audio to caller
+    //
     const speakText = async (text) => {
       if (!streamSid || socket.readyState !== 1) return;
 
       try {
         fastify.log.info(`[TTS] Speaking: "${text}"`);
 
-        const stream = await tts.getStream(text, { emotion: 'cheerful' });
+        const azureStream = await tts.getStream(text, { emotion: 'cheerful' });
+        const chunker     = new ChunkStream(FRAME_BYTES);
+
+        // Pipe Azure stream through the 160-byte slicer
+        azureStream.pipe(chunker);
 
         await new Promise((resolve, reject) => {
-          stream.on('data', (chunk) => {
-            // chunk is already raw mulaw bytes from Azure — base64 encode and send
-            const payload  = chunk.toString('base64');
+          chunker.on('data', (frame) => {
+            // frame is exactly 160 bytes (or less for the final remainder)
+            const payload  = frame.toString('base64');
             const mediaMsg = JSON.stringify({
               event:     'media',
               streamSid,
@@ -114,37 +125,36 @@ async function mediaStreamRoute(fastify) {
             safeSend(mediaMsg);
           });
 
-          stream.on('end',   resolve);
-          stream.on('error', reject);
+          chunker.on('end',   resolve);
+          chunker.on('error', reject);
+          azureStream.on('error', reject);
         });
 
         ttsCount++;
-        fastify.log.info(`[TTS] Done speaking msg #${ttsCount}`);
+        fastify.log.info(`[TTS] Done msg #${ttsCount} streamSid=${streamSid}`);
 
       } catch (err) {
         if (err.name !== 'AbortError') {
-          fastify.log.error(`[TTS] Error: ${err.message}`);
+          fastify.log.error(`[TTS] speakText error: ${err.message}`);
         }
       }
     };
+    // ─────────────────────────────────────────────────────────────────────────
 
-    // Start sending TTS messages every 10 seconds once stream begins
     const startTtsInterval = () => {
       stopTtsInterval();
+      // Speak greeting immediately, then every 10s
+      speakText('Hello! I will send you a message every ten seconds.');
       ttsTimer = setInterval(async () => {
         const text = RANDOM_MESSAGES[msgIndex % RANDOM_MESSAGES.length];
         msgIndex++;
         await speakText(text);
       }, TTS_INTERVAL_MS);
-
-      // Speak first message immediately on stream start
-      speakText('Hello! I will send you a message every ten seconds.');
     };
 
     const stopTtsInterval = () => {
       if (ttsTimer) { clearInterval(ttsTimer); ttsTimer = null; }
     };
-    // ─────────────────────────────────────────────────────────────────────────
 
     // Message handler
     socket.on('message', async (raw) => {
@@ -169,11 +179,10 @@ async function mediaStreamRoute(fastify) {
             lastMsgAt = Date.now();
             resetInactivityTimer();
             startHeartbeat();
-            startTtsInterval();   // ← begin sending TTS every 10s
+            startTtsInterval();
             break;
 
           case 'media': {
-            // Skip outbound frames echoed back by Twilio
             if (msg.media?.track === 'outbound') break;
             if (!msg.media?.payload) break;
 
@@ -185,13 +194,11 @@ async function mediaStreamRoute(fastify) {
             }
 
             try {
-              // Decode inbound mulaw (used for future STT / VAD)
               await workerPool.execute({
                 payloadBase64: msg.media.payload,
                 streamSid,
                 timestamp:     msg.media.timestamp
               });
-
               lastMsgAt = Date.now();
               resetInactivityTimer();
 
@@ -221,7 +228,7 @@ async function mediaStreamRoute(fastify) {
             break;
 
           case 'closed':
-            fastify.log.info(`[WS] Twilio closed event streamSid=${streamSid}`);
+            fastify.log.info(`[WS] Twilio closed streamSid=${streamSid}`);
             break;
 
           default:
@@ -239,8 +246,7 @@ async function mediaStreamRoute(fastify) {
       fastify.log.warn({
         event: 'ws_closed', code,
         reason: reason.toString() || 'N/A',
-        duration_ms: duration,
-        duration_s:  (duration / 1000).toFixed(2),
+        duration_ms: duration, duration_s: (duration / 1000).toFixed(2),
         streamSid, callSid, frameCount, ttsCount,
         pool:  workerPool.getStats(),
         memMB: (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2),
